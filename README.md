@@ -3,7 +3,7 @@ Atomic clone of Proxmox LXC container filesystem
 
 This script automatically creates snapshot of Proxmox LXC container and mounts
 its whole filesystem (read only). Then it does whatever you want - just edit
-do_your_job() function below. (The example code calls rclone - might be useful
+do_your_job() function. (The example code calls rclone - might be useful
 for cloud backups.) Finally it destroys the snapshot.
 
 This script might be useful when you need access to "atomic" state of
