@@ -1,0 +1,234 @@
+#!/bin/bash
+# proxsnapclone 1.0.0
+# Copyright (c) 2021, Przemyslaw Kwiatkowski
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+# This script automatically creates snapshot of Proxmox LXC container and mounts
+# its whole filesystem (read only). Then it does whatever you want - just edit
+# do_your_job() function below. (The example code calls rclone - might be useful
+# for cloud backups.) Finally it destroys the snapshot.
+
+# This script might be useful when you need access to "atomic" state of
+# conatainer filesystem - for example in order to backup it to a cloud.
+
+# Note:
+# Whenever possible - avoid using this script!
+# It is generally bad idea to access container filesystem "from outside".
+# (Whole point of containerization is to access containerized data
+# from the container only.)
+# The problem is that you cannot create snapshot of the container filesystem
+# from inside of the container. This scrips solves the problem.
+
+# Important:
+# This script works with ZFS only.
+# This scipit must be run on PVE node.
+# This script is to be run as root.
+
+# Prerequisites:
+# Install fuse-overlayfs. ("apt install fuse-overlayfs")
+
+# Usage:
+# Edit do_your_job() function below. You may use cmdline parameters $2 and following.
+# Run it:
+# proxsnapclone <numeric_vmid> <your_args>
+# Example:
+# proxsnapclone 100 --create-empty-src-dirs --transfers=24 --progress --dry-run srv/my/very/important/data remote:folder
+
+function do_your_job() {
+    local TMP_DIR
+    local VMID
+    local SNAPNAME
+    cd "$1"
+# $1 = container root folder (r/o snapshot)
+# $2 $3 $4 ... = script cmdline parameters
+#
+# EDIT HERE:
+#
+
+    rclone sync "${@:2}"
+
+}
+
+#
+# Do not edit beyond this point. :-)
+#
+
+echo "proxsnapclone - Atomic clone of Proxmox LXC container filesystem" >&2
+
+NECESSARY_EXECUTABLES="cut date echo grep hostname pct sed sleep sort zfs fuse-overlayfs mount umount mktemp"
+if ! which $NECESSARY_EXECUTABLES >/dev/null 2>&1; then
+    echo "Missing binaries!" >&2
+    echo "Make sure these tools are available: $NECESSARY_EXECUTABLES" >&2
+    exit 255
+fi
+
+if [ "$#" -eq 0 ]; then
+    echo "missing parameters" >&2
+    exit 255
+fi
+
+function vm_snapshot() {
+    echo -n "$VMID: snapshotting... " >&2
+    if ( pct snapshot $VMID $SNAPNAME --description "proxsnapclone snapshot" >/dev/null ); then
+        echo "done" >&2
+        return 0
+    fi
+    echo "error" >&2
+    return 2
+}
+
+function vm_delsnapshot() {
+    echo -n "$VMID: deleting snapshot... " >&2
+    sleep "$SLEEP_BEFORE_DELETE"
+    if ( pct delsnapshot $VMID $SNAPNAME >/dev/null ); then
+        echo "done" >&2
+        return 0
+    fi
+    echo "failed" >&2
+    return 1
+}
+
+function get_mountpoints() {
+    local A
+    local B
+    local C
+    #rootfs:
+    A=`echo "$VMCONFIG"|grep "^rootfs: "|cut -f2 -d' '|cut -f1 -d,`
+    if ( pvesm status -enabled -storage `echo $A|cut -f1 -d:` >/dev/null 2>&1 ); then
+        B=`pvesm path $A`
+        if [ -d "$B/.zfs/snapshot/$SNAPNAME" ]; then
+            echo "/ $B 1"
+        else
+            echo "$VMID: invalid storage path: $B (skipping)" >&2
+        fi
+    else
+        echo "$VMID: invalid storage: $A (skipping)" >&2
+    fi
+    #mountpoints:
+    for A in `echo "$VMCONFIG"|grep -E '^mp[0-9]+: '|cut -d ' ' -f2`; do
+        if ( pvesm status -enabled -storage `echo $A|cut -f1 -d:` >/dev/null 2>&1 ); then
+            C=`echo "$A"|sed -s 's/^.*,mp=//'|cut -f1 -d,`
+            if [ -z "$C" ]; then
+                echo "$VMID: invaild mountpoint: $A (skipping)" >&2
+                 continue
+            fi
+            B=`echo $A|cut -d, -f1|xargs pvesm path`
+            if ! [ -d "$B/.zfs/snapshot/$SNAPNAME" ]; then
+                echo "$VMID: invalid storage path: $B (skipping)" >&2
+                continue
+            fi
+            if echo "$A"|grep ",backup=1" >/dev/null 2>&1; then
+                echo "$C $B 1"
+            else
+                echo "$C $B 0"
+            fi
+        else
+            echo "$VMID: invalid storage: $A (skipping)" >&2
+            continue
+        fi
+    done
+}
+
+function trapCleanup() {
+    trap SIGINT
+    umount -R "$TMP_DIR/root"
+    sleep 1
+    umount -R "$TMP_DIR"
+    rm -d "$TMP_DIR"
+    vm_delsnapshot
+    exit 1
+}
+
+
+function proceed() {
+    local A
+    local B
+    local C
+    local FUSE_OPTS=
+    local ABORT=0
+    local UPPER_DIR
+    local WORK_DIR
+
+    [ -z "$SNAPNAME" ] && SNAPNAME=`date +psc%s`
+    [ -z "$SLEEP_BEFORE_DELETE" ] && SLEEP_BEFORE_DELETE=0
+    VMID="${1}"
+    shift
+
+# Snapshot:
+    vm_snapshot || return $?
+    VMCONFIG=`pct config $VMID --snapshot $SNAPNAME`
+    if (echo "$VMCONFIG"|grep -q '^[[:space:]]*unprivileged:[[:space:]][[:space:]]*1[[:space:]]*$' ); then
+        FUSE_OPTS=",uidmapping=100000:0:65536,gidmapping=100000:0:65536"
+    fi
+
+# Temporary mountpoint:
+    TMP_DIR=$(mktemp -d -t proxsnapclone-XXXXXXXXXX)
+    if [ ! -d "$TMP_DIR" ]; then
+        echo "$VMID: unable to create tmpdir. (ERROR)" >&2
+        return 2
+    fi
+    mount -t tmpfs tmpfs "$TMP_DIR"
+    mkdir -p "$TMP_DIR/root"
+
+# Mount container folder tree:
+    local VM_MOUNTPOINTS=`get_mountpoints| LC_ALL=C sort`
+    while read A B C; do
+        echo -n "$VMID: mounting $A... " >&2
+        mkdir -p "$TMP_DIR/root/$A"
+        UPPER_DIR=`mktemp -d -p $TMP_DIR`
+        chown --reference="$B/.zfs/snapshot/$SNAPNAME/." $UPPER_DIR
+        chmod --reference="$B/.zfs/snapshot/$SNAPNAME/." $UPPER_DIR
+        WORK_DIR=`mktemp -d -p $TMP_DIR`
+        if ( ! fuse-overlayfs -o "lowerdir=$B/.zfs/snapshot/$SNAPNAME,upperdir=$UPPER_DIR,workdir=$WORK_DIR$FUSE_OPTS" "$TMP_DIR/root/$A" 2>/dev/null ); then
+            echo "failed" >&2
+            ABORT=1
+            break
+        fi
+        echo "done" >&2
+    done < <(echo "$VM_MOUNTPOINTS")
+
+# Perform whatever operations you want:
+    trap "trapCleanup" INT
+    ( do_your_job "$TMP_DIR/root" "$@" )
+
+# Destroy temporary mountpoint:
+    umount -R "$TMP_DIR/root"
+    sleep 1
+    umount -R "$TMP_DIR"
+    rm -d "$TMP_DIR"
+
+# Destroy snapshot:
+    vm_delsnapshot
+
+    return 0
+}
+
+
+proceed "$@"
+exit
